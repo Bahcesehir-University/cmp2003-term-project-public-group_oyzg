@@ -7,19 +7,24 @@
 #include <array>
 #include <algorithm>
 
-// --------- helpers (local only) ---------
+// ============================================================
+// Shared state (because analyzer.h has no private members)
+// Keyed by TripAnalyzer instance pointer.
+// ============================================================
+static std::unordered_map<const TripAnalyzer*, std::unordered_map<std::string, long long>> g_zoneTrips;
+static std::unordered_map<const TripAnalyzer*, std::unordered_map<std::string, std::array<long long, 24>>> g_zoneHourTrips;
+
+// --------- helpers ---------
 static inline void stripCR(std::string& s) {
     if (!s.empty() && s.back() == '\r') s.pop_back();
 }
 
 static inline bool isHeaderLine(const std::string& line) {
-    // Accept common header start
     return line.rfind("TripID", 0) == 0;
 }
 
 // Parse hour from "YYYY-MM-DD HH:MM" inside [start, end)
 static inline bool parseHour(const std::string& line, size_t start, size_t end, int& hourOut) {
-    // find space separating date/time
     size_t sp = line.find(' ', start);
     if (sp == std::string::npos || sp + 2 >= end) return false;
 
@@ -36,36 +41,21 @@ static inline bool parseHour(const std::string& line, size_t start, size_t end, 
 
 // --------- TripAnalyzer implementation ---------
 
-// Note: analyzer.h says "Parse Trips.csv, skip dirty rows, never crash"
 void TripAnalyzer::ingestFile(const std::string& csvPath) {
-    // Local state (static to this object) stored via function-local statics is NOT allowed,
-    // so we store into member-like containers via static maps in this translation unit? No.
-    // Instead, keep containers as static inside methods? also no.
-    // Since analyzer.h doesn't define members, we store counts in static variables keyed by 'this'.
-    // BUT that's messy. Better: use file-scope maps keyed by pointer. We'll avoid that by
-    // using "pimpl" is not allowed either.
-    //
-    // ==> Therefore, we keep state in this .cpp file using two static unordered_maps keyed by this pointer.
-    // This is a common workaround when headers are locked and contain no private members.
-
-    static std::unordered_map<const TripAnalyzer*, std::unordered_map<std::string, long long>> ZONE;
-    static std::unordered_map<const TripAnalyzer*, std::unordered_map<std::string, std::array<long long, 24>>> ZONEH;
-
-    auto& zoneTrips = ZONE[this];
-    auto& zoneHourTrips = ZONEH[this];
+    auto& zoneTrips = g_zoneTrips[this];
+    auto& zoneHour = g_zoneHourTrips[this];
 
     zoneTrips.clear();
-    zoneHourTrips.clear();
+    zoneHour.clear();
 
     std::ifstream in(csvPath);
     if (!in.is_open()) {
-        // Missing file => empty results (matches robustness tests)
+        // Missing file => empty results (robustness requirement)
         return;
     }
 
-    // Reserve for performance
     zoneTrips.reserve(200000);
-    zoneHourTrips.reserve(200000);
+    zoneHour.reserve(200000);
 
     std::string line;
     bool first = true;
@@ -79,7 +69,7 @@ void TripAnalyzer::ingestFile(const std::string& csvPath) {
             if (isHeaderLine(line)) continue;
         }
 
-        // Expected 6 columns => 5 commas
+        // Require exactly 6 columns (5 commas)
         size_t c1 = line.find(',');
         if (c1 == std::string::npos) continue;
         size_t c2 = line.find(',', c1 + 1);
@@ -91,16 +81,16 @@ void TripAnalyzer::ingestFile(const std::string& csvPath) {
         size_t c5 = line.find(',', c4 + 1);
         if (c5 == std::string::npos) continue;
 
-        // If there are extra commas/columns, treat as malformed to be safe
+        // If there are extra commas/columns => treat as dirty row
         if (line.find(',', c5 + 1) != std::string::npos) continue;
 
-        // PickupZoneID = column 2 (between c1+1 and c2-1)
-        if (c2 <= c1 + 1) continue; // empty pickup zone
+        // PickupZoneID = column 2
+        if (c2 <= c1 + 1) continue; // empty
         std::string zone = line.substr(c1 + 1, c2 - (c1 + 1));
         if (zone.empty()) continue;
 
-        // PickupDateTime = column 4 (between c3+1 and c4-1)
-        if (c4 <= c3 + 1) continue;
+        // PickupDateTime = column 4
+        if (c4 <= c3 + 1) continue; // empty datetime
         size_t dtStart = c3 + 1;
         size_t dtEnd = c4;
 
@@ -110,12 +100,12 @@ void TripAnalyzer::ingestFile(const std::string& csvPath) {
         // Update totals
         zoneTrips[zone]++;
 
-        auto it = zoneHourTrips.find(zone);
-        if (it == zoneHourTrips.end()) {
+        auto it = zoneHour.find(zone);
+        if (it == zoneHour.end()) {
             std::array<long long, 24> arr;
             arr.fill(0);
             arr[hour] = 1;
-            zoneHourTrips.emplace(zone, arr);
+            zoneHour.emplace(zone, arr);
         } else {
             it->second[hour]++;
         }
@@ -123,9 +113,10 @@ void TripAnalyzer::ingestFile(const std::string& csvPath) {
 }
 
 std::vector<ZoneCount> TripAnalyzer::topZones(int k) const {
-    static std::unordered_map<const TripAnalyzer*, std::unordered_map<std::string, long long>> ZONE;
-    auto itObj = ZONE.find(this);
-    if (itObj == ZONE.end() || k <= 0) return {};
+    if (k <= 0) return {};
+
+    auto itObj = g_zoneTrips.find(this);
+    if (itObj == g_zoneTrips.end()) return {};
 
     const auto& zoneTrips = itObj->second;
 
@@ -148,16 +139,17 @@ std::vector<ZoneCount> TripAnalyzer::topZones(int k) const {
 }
 
 std::vector<SlotCount> TripAnalyzer::topBusySlots(int k) const {
-    static std::unordered_map<const TripAnalyzer*, std::unordered_map<std::string, std::array<long long, 24>>> ZONEH;
-    auto itObj = ZONEH.find(this);
-    if (itObj == ZONEH.end() || k <= 0) return {};
+    if (k <= 0) return {};
 
-    const auto& zoneHourTrips = itObj->second;
+    auto itObj = g_zoneHourTrips.find(this);
+    if (itObj == g_zoneHourTrips.end()) return {};
+
+    const auto& zoneHour = itObj->second;
 
     std::vector<SlotCount> v;
-    v.reserve(zoneHourTrips.size() * 2);
+    v.reserve(zoneHour.size() * 2);
 
-    for (const auto& kv : zoneHourTrips) {
+    for (const auto& kv : zoneHour) {
         const std::string& zone = kv.first;
         const auto& arr = kv.second;
         for (int h = 0; h < 24; ++h) {
