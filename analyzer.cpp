@@ -34,14 +34,57 @@ static inline void toUpperInPlace(std::string& s) {
     for (char& c : s) c = (char)std::toupper((unsigned char)c);
 }
 
-// case-insensitive "TripID" header detection (after trimming)
-static inline bool isHeaderLine(std::string line) {
-    trimInPlace(line);
-    if (line.empty()) return false;
+static std::vector<std::string> parseCSVLine(const std::string& line) {
+    std::vector<std::string> fields;
+    size_t i = 0;
+    std::string field;
+    bool inQuotes = false;
 
-    // take first token until comma
-    size_t c = line.find(',');
-    std::string first = (c == std::string::npos) ? line : line.substr(0, c);
+    while (i < line.size()) {
+        char ch = line[i];
+
+        if (!inQuotes && ch == ',') {
+            fields.push_back(field);
+            field.clear();
+            ++i;
+            continue;
+        }
+
+        if (ch == '"') {
+            if (!inQuotes) {
+                inQuotes = true;
+                ++i;
+                continue;
+            } else {
+                if (i + 1 < line.size() && line[i + 1] == '"') {
+                    field += '"';
+                    i += 2;
+                    continue;
+                } else {
+                    inQuotes = false;
+                    ++i;
+                    continue;
+                }
+            }
+        }
+
+        field += ch;
+        ++i;
+    }
+
+    if (!field.empty() || inQuotes) {
+        fields.push_back(field);
+    }
+
+    return fields;
+}
+
+// case-insensitive "TripID" header detection (after trimming)
+static inline bool isHeaderLine(const std::string& line) {
+    auto fields = parseCSVLine(line);
+    if (fields.empty()) return false;
+
+    std::string first = fields[0];
     trimInPlace(first);
     toUpperInPlace(first);
     return (first == "TRIPID");
@@ -57,39 +100,37 @@ static inline bool parseHourFromDatetime(std::string dt, int& hourOut) {
     size_t colon = dt.find(':');
     if (colon == std::string::npos) return false;
 
-    // Find the start of the hour: go back from colon-1 until non-digit or beginning
     size_t end = colon - 1;
     if (end >= dt.size()) return false; // invalid
     size_t start = end;
     while (start > 0 && std::isdigit((unsigned char)dt[start - 1])) --start;
 
-    // Now dt[start..end] is the hour string
     std::string hStr = dt.substr(start, end - start + 1);
     if (hStr.empty() || hStr.size() > 2) return false;
 
     if (!std::all_of(hStr.begin(), hStr.end(), [](char c){ return std::isdigit((unsigned char)c); })) return false;
 
     int h = std::stoi(hStr);
-    if (h < 0 || h > 23) return false;
+
+    std::string dtUpper = dt;
+    toUpperInPlace(dtUpper);
+    bool hasAm = dtUpper.find("AM") != std::string::npos;
+    bool hasPm = dtUpper.find("PM") != std::string::npos;
+
+    if (hasAm || hasPm) {
+        // 12-hour format
+        if (h < 1 || h > 12) return false;
+        if (hasPm) {
+            if (h != 12) h += 12;
+        } else { // AM
+            if (h == 12) h = 0;
+        }
+    } else {
+        // 24-hour format
+        if (h < 0 || h > 23) return false;
+    }
 
     hourOut = h;
-    return true;
-}
-
-// Get next field [pos..comma) and advance pos to after comma.
-// Returns false if no more data.
-// If allowEnd = true, returns last field until end.
-static inline bool readField(const std::string& line, size_t& pos, std::string& out, bool allowEnd = true) {
-    if (pos > line.size()) return false;
-    size_t comma = line.find(',', pos);
-    if (comma == std::string::npos) {
-        if (!allowEnd) return false;
-        out = line.substr(pos);
-        pos = line.size() + 1;
-        return true;
-    }
-    out = line.substr(pos, comma - pos);
-    pos = comma + 1;
     return true;
 }
 
@@ -109,37 +150,24 @@ void TripAnalyzer::ingestFile(const std::string& csvPath) {
     }
 
     std::string line;
-    bool firstLineChecked = false;
-
     while (std::getline(in, line)) {
         stripCR(line);
         if (line.empty()) continue;
 
         // skip header (case-insensitive)
-        if (!firstLineChecked) {
-            firstLineChecked = true;
-            if (isHeaderLine(line)) continue;
-        } else {
-            // also skip accidental header lines inside dirty data
-            if (isHeaderLine(line)) continue;
-        }
+        if (isHeaderLine(line)) continue;
 
-        // We want at least: TripID, PickupZoneID, DropoffZoneID, PickupDateTime, TripDistance, FareAmount
-        // BUT: for dirty data we will accept extra columns and ignore them.
-        size_t pos = 0;
-        std::string f1, pickupZone, f3, pickupDT, f5, f6;
+        auto fields = parseCSVLine(line);
+        if (fields.size() < 6) continue;
 
-        if (!readField(line, pos, f1, false)) continue;           // TripID
-        if (!readField(line, pos, pickupZone, false)) continue;   // PickupZoneID
-        if (!readField(line, pos, f3, false)) continue;           // DropoffZoneID
-        if (!readField(line, pos, pickupDT, false)) continue;     // PickupDateTime
-        if (!readField(line, pos, f5, false)) continue;           // TripDistance
-        if (!readField(line, pos, f6, true))  continue;           // FareAmount (or rest)
+        std::string pickupZone = fields[1];
+        std::string pickupDT = fields[3];
 
         trimInPlace(pickupZone);
         if (pickupZone.empty()) continue;
 
-        // No normalization to upper; treat as case-sensitive
+        // case-insensitivity requirement: normalize zone ids
+        toUpperInPlace(pickupZone);
 
         trimInPlace(pickupDT);
         int hour = -1;
@@ -197,7 +225,7 @@ std::vector<SlotCount> TripAnalyzer::topBusySlots(int k) const {
     const auto& zoneHour = itObj->second;
 
     std::vector<SlotCount> v;
-    v.reserve(zoneHour.size()); // will grow but fine
+    v.reserve(zoneHour.size() * 24 / 2); // rough estimate
 
     for (const auto& kv : zoneHour) {
         const std::string& zone = kv.first;
