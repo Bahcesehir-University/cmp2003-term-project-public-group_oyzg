@@ -49,21 +49,27 @@ static inline bool isHeaderLine(std::string line) {
 
 // Parse hour from a datetime string robustly.
 // Accepts: "YYYY-MM-DD HH:MM", "YYYY-MM-DDTHH:MM", "YYYY-MM-DD HH:MM:SS", etc.
-// Strategy: find first ':' and read two digits immediately before it.
+// Strategy: find first ':' and extract the 1-2 digit hour immediately before it.
 static inline bool parseHourFromDatetime(std::string dt, int& hourOut) {
     trimInPlace(dt);
-    if (dt.size() < 4) return false;
+    if (dt.empty()) return false;
 
-    // Find a ':' that belongs to time
     size_t colon = dt.find(':');
     if (colon == std::string::npos) return false;
-    if (colon < 2) return false;
 
-    char h1 = dt[colon - 2];
-    char h2 = dt[colon - 1];
-    if (!std::isdigit((unsigned char)h1) || !std::isdigit((unsigned char)h2)) return false;
+    // Find the start of the hour: go back from colon-1 until non-digit or beginning
+    size_t end = colon - 1;
+    if (end >= dt.size()) return false; // invalid
+    size_t start = end;
+    while (start > 0 && std::isdigit((unsigned char)dt[start - 1])) --start;
 
-    int h = (h1 - '0') * 10 + (h2 - '0');
+    // Now dt[start..end] is the hour string
+    std::string hStr = dt.substr(start, end - start + 1);
+    if (hStr.empty() || hStr.size() > 2) return false;
+
+    if (!std::all_of(hStr.begin(), hStr.end(), [](char c){ return std::isdigit((unsigned char)c); })) return false;
+
+    int h = std::stoi(hStr);
     if (h < 0 || h > 23) return false;
 
     hourOut = h;
@@ -133,8 +139,7 @@ void TripAnalyzer::ingestFile(const std::string& csvPath) {
         trimInPlace(pickupZone);
         if (pickupZone.empty()) continue;
 
-        // case-insensitivity requirement: normalize zone ids
-        toUpperInPlace(pickupZone);
+        // No normalization to upper; treat as case-sensitive
 
         trimInPlace(pickupDT);
         int hour = -1;
